@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Blood Logistics Sim</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useRef } = React;
+
+const FONT = `@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Bebas+Neue&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');`;
+const API = "http://localhost:5000";
+
+const PRESETS = [
+  { id: "coin", label: "COIN / Stability", description: "Low-intensity operations, permissive airspace, frequent resupply", casualtyRate: 10, resupplyHrs: 24, wbbRate: 4, t1Pct: 3, t1Units: 12, blackouts: 0, kiaEligible: 15, wiaStable: 20 },
+  { id: "lsco_doc", label: "LSCO — Doctrinal", description: "Large-scale combat, 72-hr PAR resupply, McWhirter registry rates", casualtyRate: 50, resupplyHrs: 72, wbbRate: 10, t1Pct: 5, t1Units: 24, blackouts: 2, kiaEligible: 10, wiaStable: 15 },
+  { id: "lsco_stress", label: "LSCO — Stressed", description: "High-tempo near-peer, contested airspace, prolonged blackouts", casualtyRate: 80, resupplyHrs: 150, wbbRate: 6, t1Pct: 7, t1Units: 36, blackouts: 3, kiaEligible: 8, wiaStable: 10 },
+  { id: "blood_spare", label: "Blood-Sparing Tech", description: "Hemostatic adjuncts reduce T1 unit demand (EPR-CAT scenario)", casualtyRate: 50, resupplyHrs: 72, wbbRate: 10, t1Pct: 5, t1Units: 8, blackouts: 2, kiaEligible: 10, wiaStable: 15 },
+];
+
+function computeEstimates(cfg) {
+  const { casualtyRate, resupplyHrs, wbbRate, t1Pct, t1Units, blackouts, initWBB, initRBC, initFFP } = cfg;
+  const T = 720, bkHrs = blackouts * 72, effT = T - bkHrs;
+  const baseRate = casualtyRate / 24, surgeRate = baseRate * 2;
+  const totalCas = baseRate * (T - 120) + surgeRate * 120;
+  const t1F = t1Pct / 100, t2F = 0.12;
+  const t1Pts = totalCas * t1F, t2Pts = totalCas * t2F;
+  const totalDemand = t1Pts * t1Units + t2Pts * 6;
+  const nResupply = Math.floor(effT / resupplyHrs);
+  const totalSupply = nResupply * 120 + initWBB + initRBC + initFFP + wbbRate * T * 0.10;
+  const unmet = Math.max(0, Math.round(totalDemand - totalSupply));
+  const fillRate = Math.min(100, totalSupply / Math.max(totalDemand, 1) * 100).toFixed(1);
+  const peakHourly = surgeRate * t1F * (t1Units / 2.25) + surgeRate * t2F * 6 / 24;
+  const ttf = Math.min((initWBB + initRBC * 0.6) / Math.max(peakHourly, 0.1), resupplyHrs).toFixed(1);
+  const surgsCompleted = Math.round(Math.min(t1Pts, (2 * (24 / 2.25)) * 30));
+  let sysStatus = "OPERATIONAL";
+  if (unmet > 800) sysStatus = "CRITICAL";
+  else if (unmet > 200) sysStatus = "DEGRADED";
+  else if (unmet > 0) sysStatus = "STRAINED";
+  return { totalCas: Math.round(totalCas), t1Pts: Math.round(t1Pts), t2Pts: Math.round(t2Pts), totalDemand: Math.round(totalDemand), totalSupply: Math.round(totalSupply), unmet, fillRate, ttf, surgsCompleted, nResupply, sysStatus };
+}
+
+function ToggleGroup({ options, value, onChange, format = (v) => v }) {
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {options.map((opt) => {
+        const active = opt === value;
+        return <button key={String(opt)} onClick={() => onChange(opt)} style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, fontWeight: active ? 600 : 400, padding: "7px 14px", border: active ? "2px solid #c8a84b" : "1px solid #2a3040", background: active ? "#c8a84b" : "#12161c", color: active ? "#000" : "#7a8899", cursor: "pointer", transition: "all 0.12s", letterSpacing: "0.5px" }}>{format(opt)}</button>;
+      })}
+    </div>
+  );
+}
+
+function SliderField({ label, value, min, max, step, onChange, format = (v) => v, ticks }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase" }}>{label}</span>
+        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, color: "#c8a84b", fontWeight: 600 }}>{format(value)}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} style={{ width: "100%", accentColor: "#c8a84b", cursor: "pointer" }} />
+      {ticks && <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>{ticks.map((t) => <span key={t} style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#3a4455" }}>{t}</span>)}</div>}
+    </div>
+  );
+}
+
+function Section({ title, accent = "#c8a84b", children }) {
+  return (
+    <div style={{ background: "#0e1218", border: "1px solid #1e2530", borderTop: `3px solid ${accent}`, padding: "22px 20px", marginBottom: 14 }}>
+      <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 14, letterSpacing: 4, color: accent, marginBottom: 18, display: "flex", alignItems: "center", gap: 10 }}>
+        {title}<div style={{ flex: 1, height: 1, background: "#1e2530" }} />
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function TierBar({ label, pct, color, units, desc }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "48px 1fr 52px 70px", gap: 12, alignItems: "center", marginBottom: 14 }}>
+      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, fontWeight: 600, color: "#cdd5e0" }}>{label}</span>
+      <div>
+        <div style={{ background: "#1a2030", height: 8, borderRadius: 1 }}>
+          <div style={{ width: `${Math.min(pct, 100)}%`, height: "100%", background: color, borderRadius: 1, transition: "width 0.3s" }} />
+        </div>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#3a4a5a", marginTop: 3 }}>{desc}</div>
+      </div>
+      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#5a6878", textAlign: "right" }}>{pct.toFixed(0)}%</span>
+      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color, textAlign: "right", fontWeight: 600 }}>{units}</span>
+    </div>
+  );
+}
+
+function Card({ label, value, unit = "", status = "neutral" }) {
+  const colors = { ok: "#27ae60", warn: "#c8a84b", danger: "#c0392b", neutral: "#cdd5e0" };
+  return (
+    <div style={{ background: "#12161c", border: "1px solid #1e2530", padding: "16px 14px" }}>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 22, fontWeight: 600, color: colors[status], lineHeight: 1, marginBottom: 6 }}>
+        {value}<span style={{ fontSize: 11, marginLeft: 3, color: "#5a6878" }}>{unit}</span>
+      </div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, letterSpacing: 1.5, color: "#4a5568", textTransform: "uppercase" }}>{label}</div>
+    </div>
+  );
+}
+
+function WideCard({ label, value, unit = "", status = "neutral", sub }) {
+  const colors = { ok: "#27ae60", warn: "#c8a84b", danger: "#c0392b", neutral: "#cdd5e0" };
+  const c = colors[status] || colors.neutral;
+  return (
+    <div style={{ background: "#12161c", border: `1px solid ${c}50`, padding: "20px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 5 }}>{label}</div>
+        {sub && <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 8, color: "#3a4455", lineHeight: 1.4 }}>{sub}</div>}
+      </div>
+      <div style={{ textAlign: "right", flexShrink: 0 }}>
+        <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 42, letterSpacing: 2, color: c, lineHeight: 1 }}>{value}</div>
+        {unit && <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: c, opacity: 0.7, marginTop: 2 }}>{unit}</div>}
+      </div>
+    </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "48px 0", gap: 16 }}>
+      <div style={{ width: 36, height: 36, border: "3px solid #1e2530", borderTop: "3px solid #c8a84b", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#5a6478", letterSpacing: 2 }}>RUNNING SIMULATION...</div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#3a4a5a" }}>30-day horizon · 7,200 timesteps · simulation_tiered.py</div>
+    </div>
+  );
+}
+
+function ResultsPanel({ results, isApprox }) {
+  const r = results || {};
+  const badge = isApprox
+    ? { text: "SYSTEM ESTIMATE", color: "#c8a84b" }
+    : { text: "✓ SIMULATION OUTPUT — deterministic · simulation_tiered.py", color: "#27ae60" };
+  const unmet     = isApprox ? r.unmet         : r.unmet_total;
+  const fillRate  = isApprox ? r.fillRate       : (r.fill_rate !== undefined ? r.fill_rate.toFixed(1) : (Math.min(100, r.full_mtp_total / Math.max(r.full_mtp_total + r.unmet_total, 1) * 100)).toFixed(1));
+  const ttf       = isApprox ? r.ttf           : (r.first_failure_time != null ? (r.first_failure_time / 24).toFixed(1) : "—");
+  const ttfUnit   = isApprox ? "hrs"           : "days";
+  const surgs     = isApprox ? r.surgsCompleted : r.surgeries_completed;
+  const cumDeaths = isApprox ? "—" : (r.cumulative_deaths != null ? r.cumulative_deaths.toLocaleString() : "—");
+  const waitD     = isApprox ? "—" : (r.surgery_wait_deaths != null ? r.surgery_wait_deaths : "—");
+
+  return (
+    <div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: badge.color, letterSpacing: 1, marginBottom: 12, padding: "6px 10px", border: `1px solid ${badge.color}20`, background: `${badge.color}08`, display: "inline-block" }}>{badge.text}</div>
+
+      {/* ── Tier 1: Headline wide cards — the three numbers that matter most ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 8 }}>
+        <WideCard
+          label="Unmet Demand"
+          value={typeof unmet === "number" ? unmet.toLocaleString() : (unmet ?? "—")}
+          unit="units"
+          status={unmet > 200 ? "danger" : unmet > 0 ? "warn" : "ok"}
+          sub="Total blood units requested but not delivered" />
+        <WideCard
+          label="Cumulative Deaths"
+          value={cumDeaths}
+          status={!isApprox && r.cumulative_deaths > 0 ? (r.cumulative_deaths > 500 ? "danger" : "warn") : "neutral"}
+          sub="All preventable deaths attributed to blood supply failure" />
+        <WideCard
+          label="Deaths Waiting for OR"
+          value={waitD}
+          status={!isApprox && r.surgery_wait_deaths > 0 ? "danger" : "neutral"}
+          sub="T1 patients who died in queue — OR blocked by no blood" />
+      </div>
+
+      {/* ── Tier 2: Secondary ops metrics ──────────────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 8 }}>
+        <Card label="Fill Rate"               value={`${fillRate}%`} status={+fillRate < 70 ? "danger" : +fillRate < 90 ? "warn" : "ok"} />
+        <Card label={isApprox ? "Est. Time to First Failure" : "Time to First Failure"} value={`~${ttf}`} unit={ttfUnit} status={isApprox ? (+ttf < 24 ? "danger" : +ttf < 48 ? "warn" : "ok") : (+ttf < 1 ? "danger" : +ttf < 2 ? "warn" : "ok")} />
+        <Card label="Surgeries Completed"     value={surgs ?? "—"} />
+        <Card label="Patients Evacuated (CASEVAC)" value={isApprox ? "—" : r.evac_count != null ? r.evac_count : "—"} />
+      </div>
+
+      {/* ── Tier 3: Death breakdown + treatment detail ─────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+        <Card label="↳ No Blood (T2)"             value={isApprox ? "—" : r.deaths_no_blood_t2 != null ? r.deaths_no_blood_t2 : "—"} />
+        <Card label="↳ Partial Tx (50%)"          value={isApprox ? "—" : r.deaths_partial_tx  != null ? r.deaths_partial_tx  : "—"} />
+        <Card label="↳ T2 Sepsis/MOF in PCC"      value={isApprox ? "—" : r.t2_pcc_deaths != null ? r.t2_pcc_deaths : "—"} status={!isApprox && r.t2_pcc_deaths > 0 ? "warn" : "neutral"} />
+        <Card label="↳ T1 Post-Op (awaiting evac)" value={isApprox ? "—" : r.pacu_deaths != null ? r.pacu_deaths : "—"} />
+        <Card label="↳ Deaths Waiting for OR"      value={isApprox ? "—" : r.surgery_wait_deaths != null ? r.surgery_wait_deaths : "—"} />
+        <Card label="↳ T1 PCC Overflow"           value={isApprox ? "—" : r.pcc_deaths != null ? r.pcc_deaths : "—"} />
+        <Card label="Full MTP Treatments"      value={isApprox ? "—" : r.full_mtp_total != null ? r.full_mtp_total.toFixed(0) : "—"} />
+        <Card label="Partial Treatments"       value={isApprox ? "—" : r.partial_tx_total != null ? r.partial_tx_total.toFixed(0) : "—"} />
+        <Card label="OR Operating Time"        value={isApprox ? "—" : r.or_operating_time != null ? r.or_operating_time.toFixed(0) : "—"} unit={isApprox ? "" : "hrs"} />
+        <Card label="Kit Stockouts"            value={isApprox ? "—" : r.kit_stockouts != null ? r.kit_stockouts : "—"} status={!isApprox && r.kit_stockouts > 5 ? "warn" : "neutral"} />
+        <Card label="Surgeon Shortage" value={isApprox ? "—" : r.surgeon_shortage_hours != null ? r.surgeon_shortage_hours.toFixed(0) : "—"} unit={isApprox ? "" : "OR-hrs idle"} status={!isApprox && r.surgeon_shortage_hours > 50 ? "warn" : "neutral"} />
+        <Card label="Adjuncts: KIA &amp; WIA Augmentation" value={isApprox ? "—" : (r.FWB_from_DD != null && r.FWB_from_WIA != null) ? (r.FWB_from_DD + r.FWB_from_WIA).toFixed(0) : "—"} unit={isApprox ? "" : "u"} status="neutral" />
+        <Card label="WBB Generated"           value={isApprox ? "—" : r.FWB_from_WBB != null ? r.FWB_from_WBB.toFixed(0) : "—"} unit={isApprox ? "" : "u"} status="neutral" />
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [activePreset, setActivePreset] = useState("lsco_doc");
+  const [casualtyRate, setCasualtyRate] = useState(50);
+  const [resupplyHrs,  setResupplyHrs]  = useState(72);
+  const [wbbRate,      setWbbRate]      = useState(10);
+  const [t1Pct,        setT1Pct]        = useState(5);
+  const [t1Units,      setT1Units]      = useState(24);
+  const [blackouts,    setBlackouts]    = useState(2);
+  const [initWBB,      setInitWBB]      = useState(60);
+  const [initRBC,      setInitRBC]      = useState(60);
+  const [initFFP,      setInitFFP]      = useState(40);
+  const [dcsKits,      setDcsKits]      = useState(30);
+  const [surgeonsPerNode, setSurgeonsPerNode] = useState(2);
+  const [maxSurgHours,    setMaxSurgHours]    = useState(12);
+  const [mttd,         setMttd]         = useState(4);
+  const [pacuLos,      setPacuLos]      = useState(6);
+  const [kiaEligible,  setKiaEligible]  = useState(10);
+  const [wiaStable,    setWiaStable]    = useState(15);
+  const [simStatus,    setSimStatus]    = useState("idle");
+  const [simResults,   setSimResults]   = useState(null);
+  const [simError,     setSimError]     = useState(null);
+  const [serverOnline, setServerOnline] = useState(null);
+  const resultsRef = useRef(null);
+
+  const dirty = () => { setSimResults(null); setSimStatus("idle"); };
+  const applyPreset = (p) => { setActivePreset(p.id); setCasualtyRate(p.casualtyRate); setResupplyHrs(p.resupplyHrs); setWbbRate(p.wbbRate); setT1Pct(p.t1Pct); setT1Units(p.t1Units); setBlackouts(p.blackouts); setKiaEligible(p.kiaEligible); setWiaStable(p.wiaStable); dirty(); };
+
+  const cfg = { casualtyRate, resupplyHrs, wbbRate, t1Pct, t1Units, blackouts, initWBB, initRBC, initFFP };
+  const est = useMemo(() => computeEstimates(cfg), [casualtyRate, resupplyHrs, wbbRate, t1Pct, t1Units, blackouts, initWBB, initRBC, initFFP]);
+  const t2Pct = 12, t3Pct = Math.max(0, 100 - t1Pct - t2Pct);
+  const statusColor = { OPERATIONAL: "#27ae60", STRAINED: "#c8a84b", DEGRADED: "#e67e22", CRITICAL: "#c0392b" }[est.sysStatus];
+
+  const checkServer = async () => {
+    try { const r = await fetch(`${API}/health`, { signal: AbortSignal.timeout(2000), headers: ACCESS_TOKEN ? {"X-Access-Token": ACCESS_TOKEN} : {} }); setServerOnline(r.ok); }
+    catch (e) { setServerOnline(false); }
+  };
+
+  const runSim = async () => {
+    setSimStatus("running"); setSimResults(null); setSimError(null);
+    try {
+      const headers = { "Content-Type": "application/json", ...(ACCESS_TOKEN ? {"X-Access-Token": ACCESS_TOKEN} : {}) };
+      const res = await fetch(`${API}/run`, { method: "POST", headers, body: JSON.stringify({ casualtyRate, resupplyHrs, wbbRate, t1Pct, t1Units, blackouts, initWBB, initRBC, initFFP, dcsKits, mttd, pacuLos, kiaEligible, wiaStable, surgeonsPerNode, maxSurgHours }) });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error || `Server error ${res.status}`); }
+      const data = await res.json();
+      setSimResults(data); setSimStatus("done");
+      setTimeout(() => resultsRef.current && resultsRef.current.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+    } catch(e) { setSimError(e.message); setSimStatus("error"); }
+  };
+
+  const serverDot   = serverOnline === null ? "#3a4a5a" : serverOnline ? "#27ae60" : "#c0392b";
+  const serverLabel = serverOnline === null ? "Click to check server" : serverOnline ? "Server online" : "Server offline — run: python server.py";
+
+  return (
+    <div style={{ background: "#080b0f", minHeight: "100vh", color: "#cdd5e0", fontFamily: "'IBM Plex Sans', sans-serif" }}>
+      <style>{FONT + `
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
+        input[type=range]{-webkit-appearance:none;width:100%;height:4px;background:#1a2030;border-radius:2px;outline:none;cursor:pointer}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:#c8a84b;border-radius:0;cursor:pointer;transition:transform .1s}
+        input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.25)}
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#080b0f}::-webkit-scrollbar-thumb{background:#2a3040}
+      `}</style>
+      <div style={{ maxWidth: 1080, margin: "0 auto", padding: "32px 20px 80px" }}>
+
+        <div style={{ borderBottom: "1px solid #1a2030", paddingBottom: 22, marginBottom: 28 }}>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, letterSpacing: 3, color: "#c8a84b", marginBottom: 8, background: "rgba(200,168,75,0.1)", display: "inline-block", padding: "3px 10px" }}>UNCLASSIFIED // TRAINING USE ONLY</div>
+          <h1 style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 36, letterSpacing: 4, color: "#fff", lineHeight: 1, margin: "8px 0 4px" }}>Role II Blood Logistics — Scenario Configurator</h1>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: "#3a4a5a", letterSpacing: 2 }}>SPATIOTEMPORAL SIMULATION v3 · McWhirter DODTR 2024 · 5-NODE LSCO NETWORK</div>
+        </div>
+
+        <div style={{ display: "flex", background: "#0e1218", border: "1px solid #1e2530", marginBottom: 16, overflow: "hidden" }}>
+          {[
+            { label: "System Estimate", val: est.sysStatus, color: statusColor },
+            { label: "Est. Fill Rate",  val: `${est.fillRate}%`, color: +est.fillRate < 70 ? "#c0392b" : +est.fillRate < 90 ? "#c8a84b" : "#27ae60" },
+            { label: "Est. T-to-Failure", val: `~${est.ttf}h`, color: +est.ttf < 24 ? "#c0392b" : +est.ttf < 48 ? "#c8a84b" : "#27ae60" },
+            { label: "Resupply / 30d",  val: est.nResupply, color: "#cdd5e0" },
+            { label: "Est. Unmet",      val: `${est.unmet.toLocaleString()}u`, color: est.unmet > 200 ? "#c0392b" : est.unmet > 0 ? "#c8a84b" : "#27ae60" },
+            { label: "Blackouts",       val: blackouts === 0 ? "CLEAR" : `${blackouts} WINDOW${blackouts > 1 ? "S" : ""}`, color: blackouts === 0 ? "#27ae60" : blackouts <= 2 ? "#c8a84b" : "#c0392b" },
+          ].map((s, i) => (
+            <div key={i} style={{ flex: 1, padding: "12px 14px", borderRight: "1px solid #1e2530" }}>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#3a4a5a", letterSpacing: 1.5, marginBottom: 4, textTransform: "uppercase" }}>{s.label}</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, fontWeight: 600, color: s.color }}>{s.val}</div>
+            </div>
+          ))}
+        </div>
+
+        <Section title="Scenario Preset">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+            {PRESETS.map((p) => (
+              <div key={p.id} onClick={() => applyPreset(p)} style={{ border: activePreset === p.id ? "2px solid #c8a84b" : "1px solid #1e2530", background: activePreset === p.id ? "rgba(200,168,75,0.05)" : "#0a0d12", padding: 14, cursor: "pointer", transition: "all 0.12s", position: "relative" }}>
+                {activePreset === p.id && <div style={{ position: "absolute", top: 8, right: 10, fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#c8a84b" }}>▶ ACTIVE</div>}
+                <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 16, letterSpacing: 2, color: "#fff", marginBottom: 6 }}>{p.label}</div>
+                <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 11, color: "#5a6878", lineHeight: 1.5 }}>{p.description}</div>
+                <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+                  <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: "#c8a84b" }}>{p.casualtyRate} cas/day</span>
+                  <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: "#5a6878" }}>{p.resupplyHrs}h resupply</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Section>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <Section title="Operational Tempo">
+            <SliderField label="Casualty Rate" value={casualtyRate} min={5} max={150} step={5} onChange={(v)=>{setCasualtyRate(v);setActivePreset("custom");dirty();}} format={(v)=>`${v} / day`} ticks={[5,40,75,110,150]} />
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>Blackout Windows</div>
+              <ToggleGroup options={[0,1,2,3,4]} value={blackouts} onChange={(v)=>{setBlackouts(v);setActivePreset("custom");dirty();}} format={(v)=>{
+                const labels = [
+                  "None - Permissive",
+                  "1 Window (Day 5-8)",
+                  "2 Windows (Day 5-8, 18-21)",
+                  "3 Windows (Day 5-8, 10-13, 18-21)",
+                  "4 Windows (Day 5-8, 10-13, 18-21, 24-27)"
+                ];
+                return labels[v];
+              }} />
+            </div>
+            <SliderField label="KIA Eligible for Donation (%)" value={kiaEligible} min={0} max={30} step={1} onChange={(v)=>{setKiaEligible(v);setActivePreset("custom");dirty();}} format={(v)=>`${v}%`} ticks={[0,10,20,30]} />
+            <SliderField label="WIA Stable Donors (%)" value={wiaStable} min={0} max={30} step={1} onChange={(v)=>{setWiaStable(v);setActivePreset("custom");dirty();}} format={(v)=>`${v}%`} ticks={[0,10,20,30]} />
+          </Section>
+          <Section title="Resupply and Blood Stock">
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>Resupply Interval</div>
+              <ToggleGroup options={[24,48,72,96,150,200]} value={resupplyHrs} onChange={(v)=>{setResupplyHrs(v);setActivePreset("custom");dirty();}} format={(v)=>`${v}h`} />
+              <div style={{ marginTop: 8, fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: resupplyHrs > 72 ? "#c0392b" : "#27ae60" }}>{resupplyHrs <= 72 ? "Within 72-hr doctrinal PAR window" : `${resupplyHrs - 72}h beyond doctrinal guidance`}</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>WBB Generation Rate (units / hr)</div>
+              <ToggleGroup options={[2,4,6,8,10,12]} value={wbbRate} onChange={(v)=>{setWbbRate(v);setActivePreset("custom");dirty();}} format={(v)=>`${v}u`} />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+              {[{label:"Init WBB",val:initWBB,set:setInitWBB,max:120},{label:"Init RBC",val:initRBC,set:setInitRBC,max:300},{label:"Init FFP",val:initFFP,set:setInitFFP,max:200}].map(({label,val,set,max})=>(
+                <div key={label}>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#5a6478", letterSpacing: 1.5, marginBottom: 6, textTransform: "uppercase" }}>{label}</div>
+                  <input type="range" min={0} max={max} step={10} value={val} onChange={(e)=>{set(+e.target.value);setActivePreset("custom");dirty();}} />
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#c8a84b", textAlign: "center", marginTop: 4 }}>{val}u</div>
+                </div>
+              ))}
+            </div>
+          </Section>
+        </div>
+
+        <Section title="Casualty Severity Distribution - McWhirter DODTR 2024 (n=15,581)">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+            <div>
+              <SliderField label="T1 Fraction - Massive Hemorrhage / DCS Candidate" value={t1Pct} min={1} max={20} step={1} onChange={(v)=>{setT1Pct(v);setActivePreset("custom");dirty();}} format={(v)=>`${v}%`} ticks={["1%","COIN 3%","Registry 5%","LSCO 10%","20%"]} />
+              <SliderField label="T1 Units Per Patient (OR-coupled drain)" value={t1Units} min={4} max={48} step={2} onChange={(v)=>{setT1Units(v);setActivePreset("custom");dirty();}} format={(v)=>`${v} units`} ticks={["4","8 sparing","18","24 registry","36 supermassive","48"]} />
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#3a4a5a", marginTop: -8 }}>T2 locked at 12% (McWhirter registry) - T3 absorbs remainder - T2 demand = 6u at arrival</div>
+            </div>
+            <div>
+              <TierBar label="T1" pct={t1Pct} color="#c0392b" units={`${t1Units}u`} desc="Massive hemorrhage - DCS surgical candidate - OR-coupled blood drain" />
+              <TierBar label="T2" pct={t2Pct} color="#c8a84b" units="6u" desc="Submassive hemorrhage - Component therapy at arrival - No OR" />
+              <TierBar label="T3" pct={t3Pct} color="#27ae60" units="0u" desc="Minimal / walking wounded - No blood product requirement" />
+              <div style={{ background: "#0a0d12", border: "1px solid #1e2530", padding: "12px 14px", marginTop: 8 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, textAlign: "center" }}>
+                  {[{label:"T1 Patients / 30d",val:est.t1Pts},{label:"T2 Patients / 30d",val:est.t2Pts},{label:"Total Casualties",val:est.totalCas}].map(({label,val})=>(
+                    <div key={label}>
+                      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 20, fontWeight: 600, color: "#cdd5e0" }}>{val}</div>
+                      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: "#3a4a5a", textTransform: "uppercase", letterSpacing: 1, marginTop: 3 }}>{label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </Section>
+
+        <Section title="Surgical Subsystem (DCS / DCR)">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 20, marginBottom: 20 }}>
+            <div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>Mean Time to Death (hrs)</div>
+              <ToggleGroup options={[2,4,6,8]} value={mttd} onChange={(v)=>{setMttd(v);dirty();}} format={(v)=>`${v}h`} />
+            </div>
+            <div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>POST-OP SURVIVAL WINDOW (hrs)</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 8, color: "#5a6478", marginBottom: 6 }}>Max time patient survives in PACU awaiting CASEVAC — no dedicated MEDEVAC (LSCO contested airspace)</div>
+              <ToggleGroup options={[4,6,12,24,96]} value={pacuLos} onChange={(v)=>{setPacuLos(v);dirty();}} format={(v)=>`${v}h`} />
+            </div>
+            <SliderField label="DCS Kit Count" value={dcsKits} min={5} max={60} step={5} onChange={(v)=>{setDcsKits(v);dirty();}} format={(v)=>`${v} kits`} ticks={[5,20,40,60]} />
+          </div>
+          <div style={{ borderTop: "1px solid #1e2530", paddingTop: 18 }}>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 4 }}>Surgeon Availability</div>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 8, color: "#5a6478", marginBottom: 14 }}>Doctrinal FRSD: 2 surgeons/node. Rolling 24h ops tempo window — OR stays idle when no surgeon has hours remaining.</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+              <div>
+                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>Surgeons per Node</div>
+                <ToggleGroup options={[1,2,3,4]} value={surgeonsPerNode} onChange={(v)=>{setSurgeonsPerNode(v);dirty();}} format={(v)=>`${v}`} />
+              </div>
+              <div>
+                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: 2, color: "#5a6478", textTransform: "uppercase", marginBottom: 10 }}>Max OR Hrs / Day</div>
+                <ToggleGroup options={[8,10,12,16,24]} value={maxSurgHours} onChange={(v)=>{setMaxSurgHours(v);dirty();}} format={(v)=> v === 24 ? "∞" : `${v}h`} />
+              </div>
+            </div>
+          </div>
+        </Section>
+
+        <div style={{ background: "#0e1218", border: "1px solid #1e2530", borderTop: "3px solid #c8a84b", padding: "24px 20px", marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
+            <div>
+              <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 20, letterSpacing: 4, color: "#fff", marginBottom: 4 }}>
+                {simStatus === "done" ? "Simulation Complete" : simStatus === "running" ? "Running..." : "Ready to Run"}
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: "#5a6478" }}>
+                {simStatus === "done" ? "Full deterministic output from simulation_tiered.py" : "Calls simulation_tiered.py via Flask - 30-day horizon - single deterministic run"}
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }} onClick={checkServer}>
+                <div style={{ width: 8, height: 8, borderRadius: "50%", background: serverDot }} />
+                <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, color: serverDot, letterSpacing: 1 }}>{serverLabel}</span>
+              </div>
+              <button onClick={runSim} disabled={simStatus === "running"} style={{
+                fontFamily: "'Bebas Neue', sans-serif", fontSize: 18, letterSpacing: 4,
+                padding: "14px 48px",
+                background: simStatus === "running" ? "#1a2030" : simStatus === "done" ? "#1a3a1a" : "#c8a84b",
+                color: simStatus === "running" ? "#5a6478" : simStatus === "done" ? "#27ae60" : "#000",
+                border: simStatus === "done" ? "1px solid #27ae60" : "none",
+                cursor: simStatus === "running" ? "not-allowed" : "pointer",
+                transition: "all 0.15s",
+              }}>
+                {simStatus === "running" ? "Running..." : simStatus === "done" ? "Re-Run" : "Run Simulation"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div ref={resultsRef} style={{ background: "#0e1218", border: "1px solid #1e2530", borderTop: `3px solid ${simStatus === "done" ? "#27ae60" : "#c0392b"}`, padding: "22px 20px" }}>
+          <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 14, letterSpacing: 4, color: simStatus === "done" ? "#27ae60" : "#c0392b", marginBottom: 18, display: "flex", alignItems: "center", gap: 10 }}>
+            {simStatus === "done" ? "Simulation Results" : "Estimated Outcomes"}
+            <div style={{ flex: 1, height: 1, background: "#1e2530" }} />
+          </div>
+          {simStatus === "running" && <Spinner />}
+          {simStatus === "error" && (
+            <div style={{ background: "rgba(192,57,43,0.08)", border: "1px solid #c0392b", padding: "16px 20px" }}>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: "#c0392b", marginBottom: 8, fontWeight: 600 }}>SIMULATION ERROR</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#e07060", lineHeight: 1.6 }}>{simError}</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: "#5a6478", marginTop: 12 }}>Make sure server.py is running: <span style={{ color: "#c8a84b" }}>python server.py</span></div>
+            </div>
+          )}
+          {(simStatus === "idle" || simStatus === "done") && (
+            <ResultsPanel results={simStatus === "done" ? simResults : est} isApprox={simStatus !== "done"} />
+          )}
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
