@@ -8,15 +8,34 @@
 #   GET  /health — liveness check
 # ============================================================
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import numpy as np
 import traceback
+import os
+import secrets
 
 from simulation_tiered import run_single_simulation_oo, haversine
 
-app = Flask(__name__)
-CORS(app)   # allow requests from the UI (different port)
+app = Flask(__name__, static_folder="/opt/lsco-blood-logistics/static")
+CORS(app)
+
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", None)
+
+def check_auth():
+    if not ACCESS_TOKEN:
+        return True
+    auth = request.headers.get("X-Access-Token", "")
+    return secrets.compare_digest(auth, ACCESS_TOKEN)
+
+def auth_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not check_auth():
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 # ── Node network (fixed — 5-node Ukraine hotspot layout) ─────────
 N = 5
@@ -177,12 +196,18 @@ def sanitize(results):
 
 # ── Routes ────────────────────────────────────────────────────────
 
+@app.route("/")
+def index():
+    return send_from_directory("/opt/lsco-blood-logistics/static", "index.html")
+
 @app.route("/health", methods=["GET"])
+@auth_required
 def health():
     return jsonify({"status": "ok"})
 
 
 @app.route("/run", methods=["POST"])
+@auth_required
 def run_simulation():
     try:
         params = request.get_json()
