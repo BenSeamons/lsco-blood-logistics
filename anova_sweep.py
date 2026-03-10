@@ -38,7 +38,7 @@ from simulation_tiered import Simulation, run_single_simulation_oo, haversine
 
 # ── Sweep parameters ──────────────────────────────────────────────────────────
 CASUALTY_RATES  = [10, 50, 80, 110]   # cas/day/node
-RESUPPLY_HRS    = [24, 72, 150, 200]  # hours between resupply flights
+RESUPPLY_HRS = [24, 48, 72, 96, 120, 150, 168, 200]  # hours between resupply flights
 T1_PCTS         = [3, 5, 7, 10]       # % of casualties who are T1
 WBB_RATES       = [4, 8, 10, 12]      # WBB generation rate (units/hr)
 
